@@ -1,0 +1,57 @@
+# کلاستر PostgreSQL Master + 1 Standby با Streaming Replication و Continuous WAL Archiving
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: payment-db
+  namespace: payment-db
+spec:
+  instances: 2                     # 1 primary + 1 standby (streaming replication)
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.4
+
+  # --- محدودیت RPO≈0 / یکپارچگی Replication ---
+  postgresql:
+    parameters:
+      wal_level: "replica"
+      max_wal_senders: "10"
+      max_replication_slots: "10"
+      synchronous_commit: "on"     # جلوگیری از data loss در write های master
+    # به‌ازای نیاز شدیدتر به RPO=0 واقعی می‌توان synchronous replication تمام‌عیار فعال کرد:
+    # synchronous:
+    #   number: 1
+    #   maxStandbyNamesFromCluster: 1
+
+  storage:
+    size: 10Gi
+    storageClass: standard
+
+  # --- Continuous Backup + WAL Archiving برای PITR ---
+  backup:
+    barmanObjectStore:
+      destinationPath: "s3://postgres-backups/payment-db"
+      endpointURL: "http://minio.payment-db.svc:9000"
+      s3Credentials:
+        accessKeyId:
+          name: minio-creds
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: minio-creds
+          key: ACCESS_SECRET_KEY
+    retentionPolicy: "30d"
+
+  monitoring:
+    enablePodMonitor: true         # ادغام مستقیم با Prometheus (بخش مانیتورینگ)
+
+  affinity:
+    podAntiAffinityType: required   # اطمینان از قرارگیری Primary/Standby روی نودهای مجزا
+---
+# زمان‌بندی Base Backup منظم (علاوه بر WAL پیوسته) برای کاهش زمان PITR
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: payment-db-daily-backup
+  namespace: payment-db
+spec:
+  schedule: "0 2 * * *"           # هر شب ساعت ۲ بامداد
+  backupOwnerReference: self
+  cluster:
+    name: payment-db

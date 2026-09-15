@@ -1,0 +1,38 @@
+# کلاستر موقت بازیابی (Forensic Copy) برای PITR — دقیقاً معادل مرحله‌ی pitr_clone
+# در evidence/terminal-transcript.md بخش ۸، اما با مکانیزم بومی CNPG.
+#
+# استفاده: این کلاستر را کنار کلاستر اصلی (payment-db) بالا می‌آوریم، بدون قطع سرویس اصلی،
+# داده‌ی سالمِ لحظه‌ی قبل از حادثه را از آن استخراج می‌کنیم و سپس آن را حذف می‌کنیم.
+
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: payment-db-pitr-forensic
+  namespace: payment-db
+spec:
+  instances: 1
+  imageName: ghcr.io/cloudnative-pg/postgresql:16.4
+
+  storage:
+    size: 10Gi
+    storageClass: standard
+
+  bootstrap:
+    recovery:
+      source: payment-db-backup-source
+      recoveryTarget:
+        # جایگزین با timestamp دقیق «قبل از ۱۲:۴۵» که از لاگ/آنومالی تشخیص داده شده
+        targetTime: "2026-09-14 12:44:59.000000+00"
+
+  externalClusters:
+    - name: payment-db-backup-source
+      barmanObjectStore:
+        destinationPath: "s3://postgres-backups/payment-db"
+        endpointURL: "http://minio.payment-db.svc:9000"
+        s3Credentials:
+          accessKeyId:
+            name: minio-creds
+            key: ACCESS_KEY_ID
+          secretAccessKey:
+            name: minio-creds
+            key: ACCESS_SECRET_KEY
