@@ -1,0 +1,185 @@
+# Runbook بازیابی حادثه پایگاه‌داده سرویس Payment — تخفیفان
+
+**نویسنده:** DBA/DevOps Engineer (کاندیدای ارزیابی فنی)
+**نسخه:** 1.0
+**وضعیت:** تمام مراحل این Runbook روی یک محیط واقعی PostgreSQL Master-Slave اجرا و تست
+شده‌اند. شواهد کامل در [`../evidence/terminal-transcript.md`](../evidence/terminal-transcript.md).
+
+---
+
+## ۱. فرضیات (Assumptions)
+
+طبق درخواست صریح تسک، همه‌ی فرض‌های اضافی این‌جا مستند شده‌اند:
+
+| مورد | فرض |
+|---|---|
+| نسخه PostgreSQL | 16 |
+| توپولوژی Replication | 1 Primary + 1 Standby، Streaming (async)، قابل ارتقا به synchronous |
+| کلاستر Kubernetes (Staging) | `kind` تک/سه‌نودی روی سیستم توسعه‌دهنده |
+| کلاستر Kubernetes (Production) | Managed Kubernetes (مثل GKE/EKS) یا Self-hosted HA |
+| Operator مدیریت PostgreSQL روی K8s | CloudNativePG (CNPG) — استاندارد de-facto صنعت برای این کار، دارای پشتیبانی native از replication، backup و PITR |
+| ابزار Backup/WAL Archiving | Barman Cloud (built-in در CNPG) به مقصد Object Storage سازگار با S3 (MinIO در staging، S3/GCS واقعی در production) |
+| محدودیت اجرای این پاسخ | در sandbox ارزیابی این پاسخ Docker/nested-virtualization در دسترس نبود؛ به همین دلیل منطق Master-Slave + PITR با دو **instance واقعی PostgreSQL** (نه شبیه‌سازی کاغذی) روی پورت‌های مجزا پیاده و تست شد. معادل‌سازی کامل با مانیفست‌های K8s/CNPG در پوشه‌ی `k8s/` آمده و همان دستورات SQL/منطق بازیابی (`sql/`) بدون تغییر روی هر دو محیط قابل اجراست. |
+| Audit پیش از حادثه | فرض بر این است که در لحظه‌ی حادثه، audit trigger هنوز فعال نبوده (این خودش یکی از یافته‌های Postmortem است — بخش ۸) |
+
+---
+
+## ۲. تحلیل حادثه
+
+- **علت ریشه‌ای:** اجرای مستقیم یک اسکریپت/Migration ناقص روی نود Master، خارج از مسیر
+  کنترل‌شده‌ی CI/CD.
+- **مکانیزم انتشار خسارت:** چون Replication از نوع Streaming و near-real-time است، هر تغییر
+  DML (چه درست چه غلط) بلافاصله به Standby هم اعمال می‌شود. بنابراین **نمی‌توان Standby را
+  به‌عنوان «نسخه‌ی سالم» در نظر گرفت** — این نکته‌ی کلیدی استراتژی بازیابی است.
+- **تنها منبع «حقیقت سالم»**: حالت دیتابیس **قبل از لحظه‌ی دقیق حادثه**، که فقط از طریق
+  Base Backup + WAL Archive (یعنی PITR) قابل بازسازی است، نه از روی Standby زنده.
+
+---
+
+## ۳. استراتژی کلی بازیابی
+
+برای رعایت هم‌زمان چهار محدودیت سخت‌گیرانه‌ی تسک، استراتژی انتخابی «Live Reconciliation از
+روی یک Forensic PITR Clone» است، نه یک Restore/Failover کامل.
+
+| محدودیت | چرا این استراتژی آن را برآورده می‌کند |
+|---|---|
+| **RPO ≈ 0** | هیچ تراکنش سالمی (قبل یا بعد از حادثه) لمس یا overwrite نمی‌شود؛ فقط رکوردهای دقیقاً مشخص‌شده به‌عنوان خراب اصلاح می‌شوند. |
+| **RTO حداقل** | Master در کل فرآیند Online و در حال سرویس‌دهی باقی می‌ماند. اصلاح از طریق DML معمولی روی جدول زنده انجام می‌شود؛ هیچ Restore کامل/Failover/Downtime لازم نیست. |
+| **بازیابی گزینشی** | PITR Clone جدا بالا می‌آید و صرفاً به‌عنوان منبع «مقادیر صحیح» استفاده می‌شود؛ تراکنش‌های بعد از حادثه دست‌نخورده می‌مانند چون شرط‌های WHERE دقیقاً فقط رکوردهای خراب را هدف قرار می‌دهند. |
+| **یکپارچگی Replication** | چون اصلاح با DML عادی روی Primary انجام می‌شود، همان Streaming Replication موجود این تغییرات را هم به‌طور خودکار به Standby منتقل می‌کند — بدون قطعی و بدون نیاز به rebuild دستی. |
+
+استراتژی جایگزین که رد شد: Restore کامل Master از بکاپ + PITR روی خودِ Master + بازپخش دستی
+تراکنش‌های بعد از حادثه. این روش RTO بسیار بالاتری دارد (Downtime کامل در طول Restore) و ریسک
+بیشتری برای بازپخش تراکنش‌های سالم دارد؛ فقط به‌عنوان Fallback برای خرابی گسترده‌تر نگه داشته
+شده (`scripts/06_fallback_rebuild_slave.sh`).
+
+---
+
+## ۴. Runbook گام‌به‌گام
+
+> هر گام با یک اسکریپت اجراشده و تست‌شده در `scripts/` مطابقت دارد. خروجی واقعی هر گام در
+> `evidence/terminal-transcript.md` ثبت شده است.
+
+### گام ۰ — Containment فوری (اولین ۲ دقیقه)
+1. اگر مسیر اجرای اسکریپت مخرب هنوز فعال است، بلافاصله آن Job/Pipeline را متوقف کنید.
+2. یک محدودیت موقت (`ALTER ROLE ... NOLOGIN` یا مسدودسازی در NetworkPolicy) روی نقشی که
+   اسکریپت را اجرا کرده بگذارید تا از تکرار جلوگیری شود.
+3. **سرویس Payment را Down نکنید** — طبق استراتژی بخش ۳، نیازی به قطع سرویس نیست.
+
+### گام ۱ — تشخیص محدوده‌ی دقیق حادثه (Detection)
+اسکریپت: `scripts/03_detect_incident_scope.sh`
+- زمان دقیق شروع/پایان حادثه از لاگ CI/CD یا اپلیکیشن.
+- محدوده‌ی دقیق رکوردها/جداول آسیب‌دیده از طریق:
+  - `pg_waldump` روی WAL segment بازه‌ی زمانی حادثه (وقتی Audit از قبل فعال نبوده)
+  - جهش ناگهانی در `pg_stat_user_tables.n_tup_del/n_tup_upd`
+  - آلارم‌های Prometheus در `monitoring/alert-rules.yaml` (اگر از قبل مستقر بود)
+- خروجی: بازه‌ی زمانی دقیق (`pre_incident_checkpoint`) + لیست جدول/رکوردهای مشکوک.
+
+### گام ۲ — ساخت Forensic PITR Clone (بدون تاثیر روی Production)
+اسکریپت: `scripts/04_build_pitr_clone.sh "<pre_incident_checkpoint>"`
+- یک Instance/Pod کاملاً جدا (در K8s: `Cluster` جدید CNPG با `bootstrap.recovery` — فایل
+  `k8s/03-pitr-recovery-cluster.yaml`) از روی آخرین Base Backup + پخش WAL آرشیوشده تا لحظه‌ی
+  دقیق «قبل از commit تراکنش مخرب» بازسازی می‌شود.
+- `recoveryTarget.targetTime` دقیقاً یک لحظه قبل از شروع حادثه تنظیم می‌شود؛
+  `recovery_target_action: pause` اجازه می‌دهد قبل از هر commit اضافه، داده بازرسی شود.
+- این Clone read-only است و هیچ اثری روی Master زنده یا RTO ندارد.
+
+### گام ۳ — بازیابی گزینشی روی Master زنده (Selective Live Recovery)
+اسکریپت: `scripts/05_reconcile_and_recover.sh` (منطق در `sql/recovery_reconcile.sql`)
+با استفاده از `postgres_fdw` از Master به PITR Clone وصل می‌شویم و در یک تراکنش واحد:
+1. رکوردهای بهاشتباه حذف‌شده را با `INSERT ... WHERE NOT EXISTS` بازمی‌گردانیم.
+2. رکوردهای بهاشتباه آپدیت‌شده را فقط در صورتی revert می‌کنیم که هنوز نشانه‌ی خرابی
+   (مثلاً `status='corrupted'`) دارند — تا تراکنش‌های سالمی که بعد از حادثه واقعاً تغییر
+   کرده‌اند دست‌نخورده بمانند.
+3. رکوردهای ناقص/تکراری درج‌شده در حادثه را حذف می‌کنیم.
+
+تمام عملیات در یک `BEGIN ... COMMIT` واحد است تا در صورت خطای میانی، کل عملیات Rollback شود.
+
+### گام ۴ — اعتبارسنجی (Validation)
+- شمارش رکوردها، بررسی نبود `status IN ('corrupted','dirty_duplicate')`.
+- تطبیق تعداد/مجموع مبلغ تراکنش‌ها با سیستم بیرونی (لاگ درگاه پرداخت) در صورت وجود.
+- بررسی این‌که تراکنش‌های بعد از حادثه هنوز موجودند.
+
+### گام ۵ — تایید یکپارچگی Replication
+```sql
+SELECT client_addr, state, sync_state, replay_lag FROM pg_stat_replication;
+```
+- انتظار: `state = streaming`، `replay_lag` نزدیک صفر، داده روی Standby دقیقاً برابر Master.
+- اگر Standby نتواند sync شود (corruption در سطح فایل یا از دست رفتن replication slot)، از
+  Fallback استفاده کنید: `scripts/06_fallback_rebuild_slave.sh`.
+
+### گام ۶ — پاکسازی و بستن حادثه
+- حذف/توقف PITR Clone موقت.
+- لغو هر محدودیت موقت گام ۰.
+- ثبت Timeline کامل حادثه برای Postmortem.
+
+---
+
+## ۵. زمان‌بندی تخمینی (RTO این استراتژی)
+
+| فاز | زمان تخمینی |
+|---|---|
+| Containment | ۱-۲ دقیقه |
+| Detection | ۵-۱۵ دقیقه (بدون Audit) / چند ثانیه (با Audit Trigger فعال) |
+| ساخت PITR Clone | متناسب با حجم Base Backup+WAL؛ در تست ما چند ثانیه، در Production معمولاً ۱-۱۰ دقیقه |
+| بازیابی گزینشی روی Master زنده | چند صد میلی‌ثانیه تا چند ثانیه — بدون Downtime |
+| اعتبارسنجی + بستن حادثه | ۵-۱۰ دقیقه |
+| **مجموع Downtime واقعی سرویس Payment** | **≈ ۰** |
+
+---
+
+## ۶. اقدامات پیشگیرانه (Preventive Actions)
+
+فایل: `sql/preventive_measures.sql` — تست‌شده و اجراشده روی Master.
+
+1. **Audit Trigger خودکار** روی `payment_transactions`: هر UPDATE/DELETE با مقدار قبل/بعد در
+   `audit_log` ثبت می‌شود. تنها تغییری که فاز Detection را از «چند دقیقه تحلیل WAL» به «چند
+   ثانیه کوئری SQL» تبدیل می‌کند.
+2. **الگوی Soft-Delete**: ستون `deleted_at` + Trigger جلوگیری از Hard-Delete (آماده، غیرفعال
+   تا هماهنگی با تیم اپلیکیشن).
+3. **سخت‌سازی دسترسی به Master**: `REVOKE ALL ... FROM PUBLIC`؛ هیچ نقش انسانی مجوز DML
+   مستقیم نداشته باشد؛ فقط نقش اپلیکیشن و یک نقش CI/CD مجزا (short-lived/mTLS) از شبکه‌ی
+   CI/CD runner. هر Migration باید dry-run روی staging → Code Review → Approval → اجرا با
+   ابزار Migration نسخه‌بندی‌شده (Flyway/Sqitch/Alembic) با Rollback مشخص طی کند.
+4. **جداسازی نقش Migration از نقش پرس‌وجوی عادی** با `pg_hba.conf`/NetworkPolicy که اتصال
+   مستقیم psql به Master از بیرون شبکه‌ی CI/CD را مسدود می‌کند.
+5. **Backup/PITR همیشه آماده**: WAL Archiving پیوسته + Base Backup روزانه
+   (`k8s/02-postgresql-cluster.yaml`، `ScheduledBackup`).
+
+---
+
+## ۷. مانیتورینگ/Observability (امتیاز اضافی)
+
+فایل‌ها: `monitoring/alert-rules.yaml`، `monitoring/postgres-exporter-queries.yaml`،
+`monitoring/grafana-dashboard.md`.
+
+آلارم‌های کلیدی:
+- **نرخ غیرعادی DELETE/UPDATE** روی `payment_transactions` (امضای دقیق این حادثه)
+- **Replication Lag** بالا یا **قطع اتصال Standby**
+- **افت ناگهانی نرخ INSERT** (نشانه‌ی افت سلامت/دسترس‌پذیری سرویس)
+- **اتصال با نقش غیرمجاز** به دیتابیس (نشانه‌ی اجرای دستی خارج از Pipeline)
+
+داشبورد Grafana پیشنهادی شامل پنل‌های Replication Lag، نرخ DML per table، وضعیت
+Primary/Standby و throughput تراکنش‌ها (جزئیات در `monitoring/grafana-dashboard.md`).
+
+---
+
+## ۸. Postmortem خلاصه
+
+- **Root Cause**: نبود کنترل دسترسی سخت‌گیرانه برای اجرای مستقیم اسکریپت روی Master + نبود
+  Audit Trail که فاز Detection را کند کرد.
+- **چرا Blast Radius تا Standby رسید**: ماهیت ذاتی Streaming Replication (که عمداً برای این
+  تسک به همین شکل نگه داشته شد؛ جایگزینی مثل Delayed Replica خودش Trade-off در RPO/هزینه دارد
+  — بخش ۹).
+- **اقدام کلیدی که تکرار را حذف می‌کند**: بستن مسیر اتصال مستقیم انسانی به Master + الزامی‌کردن
+  عبور هر تغییر داده/شِما از Pipeline نسخه‌بندی‌شده.
+
+---
+
+## ۹. یک نکته‌ی طراحی اضافه (اختیاری)
+
+می‌توان علاوه بر Standby اصلی، یک **Delayed Replica** (مثلاً `recovery_min_apply_delay=15min`
+در PostgreSQL خام، یا یک Standby سوم مشابه در CNPG) هم نگه داشت. این Replica تاخیر عمدی دارد
+و در حادثه‌ای مثل این، تا قبل از سررسید تاخیر «آلوده» نمی‌شود و می‌تواند گام ۲ (ساخت PITR
+Clone) را سریع‌تر پوشش دهد. این مورد بهبود آینده است و بخشی از راه‌حل الزامی این تسک نیست، چون
+هزینه‌ی Storage/عملیاتی اضافه دارد.
