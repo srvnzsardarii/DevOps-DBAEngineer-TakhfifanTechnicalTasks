@@ -1,18 +1,16 @@
-# داشبورد Grafana — سلامت Payment DB
-
-پنل‌های پیشنهادی (import از Prometheus datasource که به postgres_exporter/CNPG متصل است):
-
-| پنل | متریک | هدف |
+# Grafana Dashboard — Payment DB Health
+Suggested panels (import from a Prometheus datasource connected to `postgres_exporter`/CNPG):
+| Panel | Metric | Purpose |
 |---|---|---|
-| Replication Lag (s) | `pg_replication_lag_seconds` | تشخیص زودهنگام کندی/قطع sync |
-| Connected Standbys | `pg_stat_replication_count` | اطمینان از برقراری Master-Slave |
-| DELETE Rate | `rate(pg_stat_user_tables_n_tup_del{relname="payment_transactions"}[5m])` | تشخیص حذف انبوه غیرعادی |
-| UPDATE Rate | `rate(pg_stat_user_tables_n_tup_upd{relname="payment_transactions"}[5m])` | تشخیص آپدیت انبوه غیرعادی |
-| INSERT Rate (Transaction Throughput) | `rate(pg_stat_user_tables_n_tup_ins{relname="payment_transactions"}[5m])` | افت ناگهانی = نشانه‌ی Downtime |
-| WAL Generation Rate | `pg_stat_archiver_archived_count` | حجم غیرعادی WAL = فعالیت مشکوک |
-| Active Connections by Role | `pg_stat_activity_count by (usename)` | شناسایی اتصال مستقیم غیرمجاز به Master |
-| Cluster Status (Primary/Standby) | `cnpg_collector_up` / CNPG native dashboard | وضعیت کلی از دید operator |
+| Replication Lag (s) | `pg_replication_lag_seconds` | Early detection of sync slowness/outage |
+| Connected Standbys | `pg_stat_replication_count` | Verify Master-Slave connectivity |
+| DELETE Rate | `rate(pg_stat_user_tables_n_tup_del{relname="payment_transactions"}[5m])` | Detect abnormal mass deletions |
+| UPDATE Rate | `rate(pg_stat_user_tables_n_tup_upd{relname="payment_transactions"}[5m])` | Detect abnormal mass updates |
+| INSERT Rate (Transaction Throughput) | `rate(pg_stat_user_tables_n_tup_ins{relname="payment_transactions"}[5m])` | Sudden drop = sign of downtime |
+| WAL Generation Rate | `pg_stat_archiver_archived_count` | Abnormal WAL volume = suspicious activity |
+| Active Connections by Role | `pg_stat_activity_count by (usename)` | Identify unauthorized direct connections to Master |
+| Cluster Status (Primary/Standby) | `cnpg_collector_up` / CNPG native dashboard | Overall status from the operator's perspective |
 
-فایل JSON کامل داشبورد را می‌توان بعداً بر اساس این جدول در Grafana ساخت و export کرد؛ در این
-مخزن به‌جای JSON آماده (که وابسته به دیتاسورس دقیق نصب شماست)، ساختار پنل‌ها مستند شده تا مستقیماً
-قابل پیاده‌سازی باشد.
+The complete dashboard JSON file can be created and exported in Grafana based on this table later;
+in this repository,rather than providing a pre-made JSON file (which depends on your specific
+datasource setup),the panel structure is documented so it can be implemented directly.
