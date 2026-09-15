@@ -1,0 +1,25 @@
+2026-09-14 18:19:08.916 UTC [3227] LOG:  starting PostgreSQL 16.15 (Ubuntu 16.15-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit
+2026-09-14 18:19:08.917 UTC [3227] LOG:  listening on IPv4 address "127.0.0.1", port 5434
+2026-09-14 18:19:08.917 UTC [3227] LOG:  listening on Unix socket "/var/run/postgresql/.s.PGSQL.5434"
+2026-09-14 18:19:08.923 UTC [3230] LOG:  database system was interrupted; last known up at 2026-09-14 18:12:05 UTC
+cp: cannot stat '/var/lib/postgresql/wal_archive/00000002.history': No such file or directory
+2026-09-14 18:19:09.015 UTC [3230] LOG:  starting point-in-time recovery to 2026-09-14 18:18:07.891478+00
+2026-09-14 18:19:09.015 UTC [3230] LOG:  starting backup recovery with redo LSN 0/3000028, checkpoint LSN 0/3000060, on timeline ID 1
+2026-09-14 18:19:09.108 UTC [3230] LOG:  restored log file "000000010000000000000003" from archive
+2026-09-14 18:19:09.119 UTC [3230] LOG:  redo starts at 0/3000028
+2026-09-14 18:19:09.125 UTC [3230] LOG:  restored log file "000000010000000000000004" from archive
+2026-09-14 18:19:09.138 UTC [3230] LOG:  completed backup recovery with redo LSN 0/3000028 and end LSN 0/3000100
+2026-09-14 18:19:09.138 UTC [3230] LOG:  consistent recovery state reached at 0/3000100
+2026-09-14 18:19:09.138 UTC [3227] LOG:  database system is ready to accept read-only connections
+2026-09-14 18:19:09.138 UTC [3230] LOG:  recovery stopping before commit of transaction 746, time 2026-09-14 18:18:20.801939+00
+2026-09-14 18:19:09.138 UTC [3230] LOG:  pausing at the end of recovery
+2026-09-14 18:19:09.138 UTC [3230] HINT:  Execute pg_wal_replay_resume() to promote.
+2026-09-14 18:19:46.000 UTC [3227] LOG:  received SIGHUP, reloading configuration files
+2026-09-14 18:19:54.647 UTC [3227] LOG:  received SIGHUP, reloading configuration files
+2026-09-14 18:20:19.938 UTC [3227] LOG:  received fast shutdown request
+2026-09-14 18:20:19.939 UTC [3227] LOG:  aborting any active transactions
+2026-09-14 18:20:20.212 UTC [3228] LOG:  shutting down
+2026-09-14 18:20:20.212 UTC [3228] LOG:  restartpoint starting: shutdown immediate
+2026-09-14 18:20:20.215 UTC [3228] LOG:  restartpoint complete: wrote 7 buffers (0.0%); 0 WAL file(s) added, 1 removed, 0 recycled; write=0.001 s, sync=0.001 s, total=0.003 s; sync files=5, longest=0.001 s, average=0.001 s; distance=16384 kB, estimate=16384 kB; lsn=0/4000098, redo lsn=0/4000060
+2026-09-14 18:20:20.215 UTC [3228] LOG:  recovery restart point at 0/4000060
+2026-09-14 18:20:20.217 UTC [3227] LOG:  database system is shut down
