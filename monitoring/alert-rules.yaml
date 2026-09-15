@@ -1,0 +1,66 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: payment-db-incident-detection
+  namespace: payment-db
+  labels:
+    release: prometheus
+spec:
+  groups:
+    - name: payment-db.rules
+      rules:
+        # ۱) نرخ غیرعادی DELETE/UPDATE روی جدول تراکنش‌ها (شاخص اصلی این نوع حادثه)
+        - alert: PaymentTransactionsAbnormalDeleteRate
+          expr: |
+            rate(pg_stat_user_tables_n_tup_del{relname="payment_transactions"}[5m]) > 5
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "نرخ DELETE غیرعادی روی payment_transactions"
+            description: >
+              بیش از ۵ حذف در ثانیه (میانگین ۵ دقیقه) روی جدول تراکنش‌های پرداخت شناسایی شد.
+              این الگو دقیقاً مشابه حادثه‌ی اجرای مستقیم اسکریپت روی Master است.
+
+        - alert: PaymentTransactionsAbnormalUpdateRate
+          expr: |
+            rate(pg_stat_user_tables_n_tup_upd{relname="payment_transactions"}[5m]) > 20
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "نرخ UPDATE غیرعادی روی payment_transactions"
+
+        # ۲) Replication Lag - نشانه‌ی اختلال یا شروع همگام‌سازی داده‌ی خراب
+        - alert: PostgresReplicationLagHigh
+          expr: pg_replication_lag_seconds > 10
+          for: 2m
+          labels: { severity: warning }
+          annotations:
+            summary: "Replication lag بیش از ۱۰ ثانیه بین Master و Slave"
+
+        - alert: PostgresReplicationBroken
+          expr: pg_stat_replication_count == 0
+          for: 1m
+          labels: { severity: critical }
+          annotations:
+            summary: "هیچ Standby متصلی به Master دیده نمی‌شود — Replication قطع شده است"
+
+        # ۳) اجرای مستقیم Query خارج از مسیر CI/CD روی Master (نیازمند pgaudit/log_statement)
+        - alert: DirectWriteOutsideApplicationRole
+          expr: |
+            pg_stat_activity_count{usename!~"app_.*|replicator|postgres_exporter"} > 0
+          for: 30s
+          labels: { severity: warning }
+          annotations:
+            summary: "یک اتصال با نقش غیرمجاز در حال نوشتن روی دیتابیس Payment است"
+            description: >
+              اتصال مستقیم غیر از نقش‌های اپلیکیشن به دیتابیس پرداخت وصل شده؛ می‌تواند نشانه‌ی
+              اجرای دستی/اشتباه یک اسکریپت روی Master باشد (مشابه ریشه‌ی این حادثه).
+
+        # ۴) سلامت کلی تراکنش‌ها - افت ناگهانی نرخ ثبت تراکنش موفق
+        - alert: PaymentTransactionInsertRateDropped
+          expr: |
+            rate(pg_stat_user_tables_n_tup_ins{relname="payment_transactions"}[5m]) < 0.1
+          for: 5m
+          labels: { severity: critical }
+          annotations:
+            summary: "نرخ ثبت تراکنش‌های جدید به‌شدت افت کرده — احتمال Downtime سرویس Payment"
