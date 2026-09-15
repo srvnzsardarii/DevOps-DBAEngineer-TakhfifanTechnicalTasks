@@ -1,0 +1,12 @@
+# Installing the CloudNativePG Operator
+CloudNativePG (CNPG) is used as the industry standard for managing PostgreSQL on Kubernetes. This operator natively supports Streaming Replication (Master/Standby), Continuous Backup/WAL Archiving (via Barman Cloud to S3/MinIO), and Point-In-Time Recovery, eliminating the need to implement these mechanisms manually.
+bash
+# Installation on kind/k3s cluster (staging) or Managed K8s (production)
+kubectl apply -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.24/releases/cnpg-1.24.1.yaml
+kubectl get deployment -n cnpg-system cnpg-controller-manager
+## Environment Assumptions
+- Staging/Test: Single-node or three-node `kind` cluster on a local machine
+- Production: Managed cluster (e.g., GKE/EKS or a self-hosted cluster with an HA control plane)
+- PostgreSQL Version: 16
+- Storage Class: Assumes the existence of a `StorageClass` supporting `ReadWriteOnce` PVCs (e.g., `standard` in kind or `gp3`/`pd-ssd` in cloud environments)
+- Object Storage for WAL/Backup: In-cluster MinIO for staging; actual S3/GCS for production
