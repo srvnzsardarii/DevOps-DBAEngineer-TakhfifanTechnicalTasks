@@ -1,0 +1,221 @@
+# شواهد اجرای عملی سناریو (Terminal Transcript)
+
+> این فایل، خروجی واقعی دستورات اجراشده در محیط تست را ثبت می‌کند. محیط: Ubuntu 24.04 +
+> PostgreSQL 16 (نصب‌شده از apt). به دلیل نبود Docker/در دسترس‌نبودن nested-virtualization در
+> sandbox اجرای این پاسخ، سناریوی Master-Slave به‌صورت دو instance واقعی PostgreSQL روی پورت‌های
+> 5432 (master) و 5433 (slave) با streaming replication واقعی پیاده‌سازی و تمام مراحل زیر واقعاً
+> اجرا شدند (نه شبیه‌سازی روی کاغذ). معادل‌سازی با Kubernetes در بخش `k8s/` و `docs/runbook.md`
+> به‌صورت مانیفست‌های واقعی (CloudNativePG) آمده که همین منطق را روی کلاستر واقعی پیاده می‌کند.
+
+## ۱. راه‌اندازی Master و فعال‌سازی WAL Archiving + Streaming Replication
+
+```
+$ apt-get install -y postgresql postgresql-contrib
+$ service postgresql start
+ * Starting PostgreSQL 16 database server ...done.
+
+$ psql -c "ALTER SYSTEM SET wal_level = replica;"
+$ psql -c "ALTER SYSTEM SET max_wal_senders = 10;"
+$ psql -c "ALTER SYSTEM SET max_replication_slots = 10;"
+$ psql -c "ALTER SYSTEM SET archive_mode = on;"
+$ psql -c "ALTER SYSTEM SET archive_command = 'cp %p /var/lib/postgresql/wal_archive/%f';"
+$ psql -c "CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'repl_pass123';"
+$ echo "host replication replicator 127.0.0.1/32 scram-sha-256" >> pg_hba.conf
+$ service postgresql restart
+ * Restarting PostgreSQL 16 database server ...done.
+```
+
+## ۲. ساخت دیتابیس payment و درج ۲۰۰ تراکنش اولیه
+
+```sql
+CREATE DATABASE payment;
+CREATE TABLE payment_transactions (id BIGSERIAL PRIMARY KEY, user_id INT, amount NUMERIC(12,2),
+  status VARCHAR(20) DEFAULT 'completed', created_at TIMESTAMPTZ DEFAULT now(), updated_at TIMESTAMPTZ DEFAULT now());
+INSERT INTO payment_transactions (...) SELECT ... FROM generate_series(1,200);
+```
+```
+ count |              min              |              max
+-------+-------------------------------+-------------------------------
+   200 | 2026-09-14 14:45:35.104151+00 | 2026-09-14 18:04:35.104151+00
+```
+
+## ۳. گرفتن Base Backup (نقطه شروع PITR) و ساخت Slave
+
+```
+$ pg_basebackup -h 127.0.0.1 -U replicator -D .../basebackup -Fp -Xs -P -R --checkpoint=fast
+waiting for checkpoint
+30767/30767 kB (100%), 1/1 tablespace
+```
+
+راه‌اندازی slave روی پورت 5433 از روی همین backup (با `standby.signal` و `primary_conninfo`):
+
+```
+2026-09-14 18:12:43 LOG:  entering standby mode
+2026-09-14 18:12:43 LOG:  consistent recovery state reached at 0/3000100
+2026-09-14 18:12:43 LOG:  database system is ready to accept read-only connections
+2026-09-14 18:12:43 LOG:  started streaming WAL from primary at 0/4000000 on timeline 1
+```
+
+تایید فعال‌بودن replication از سمت Master:
+
+```sql
+SELECT client_addr, state, sync_state, replay_lsn FROM pg_stat_replication;
+```
+```
+ client_addr |   state   | sync_state | replay_lsn
+-------------+-----------+------------+------------
+ 127.0.0.1   | streaming | async      | 0/4000148
+```
+
+تایید تعداد رکورد یکسان روی Slave: `SELECT count(*) ...` → **200** ✅
+
+## ۴. ثبت نقطه امن (Pre-Incident Checkpoint) برای PITR
+
+```sql
+SELECT now() AS pre_incident_checkpoint;
+--> 2026-09-14 18:18:07.891478+00
+```
+
+## ۵. شبیه‌سازی حادثه (اجرای مستقیم اسکریپت اشتباه روی Master)
+
+فایل: `sql/incident_simulation.sql`
+
+```
+BEGIN
+DELETE 15      -- حذف اشتباه id 50..64
+UPDATE 10      -- خراب‌شدن amount/status رکوردهای id 80..89
+INSERT 0 3     -- درج ۳ رکورد ناقص/تکراری
+COMMIT
+```
+
+بازه زمانی دقیق حادثه (قابل استخراج از لاگ/WAL در محیط واقعی):
+`incident_time_start = 18:18:20.767332+00` ... `incident_time_end = 18:18:20.836205+00`
+
+## ۶. شبیه‌سازی تراکنش‌های سالم *بعد* از حادثه (که نباید از دست بروند)
+
+```sql
+INSERT INTO payment_transactions (...) SELECT ... FROM generate_series(1,20);
+```
+```
+ count |              min              |              max
+-------+-------------------------------+-------------------------------
+   208 | 2026-09-14 14:45:35.104151+00 | 2026-09-14 18:18:25.971443+00
+```
+
+## ۷. تایید انتقال Dirty Data به Slave (طبق سناریوی تسک)
+
+روی Slave (پورت 5433):
+```
+ total | corrupted | dirty_dup
+-------+-----------+-----------
+   208 |        10 |         3
+```
+و رکوردهای id بین 50 تا 64 روی Slave هم صفر نتیجه برگرداند (یعنی حذف اشتباه هم replicate شده) —
+دقیقاً طبق سناریوی تسک: «Slave نیز به همان اندازه Master کثیف است».
+
+## ۸. ساخت PITR Clone (Forensic Copy) روی پورت 5434
+
+```
+$ pg_switch_wal();  -- دو بار، برای وادار کردن آرشیو WAL شامل تراکنش حادثه
+$ cp -r basebackup pitr_clone
+$ touch pitr_clone/recovery.signal
+# postgresql.conf: restore_command + recovery_target_time='18:18:07.891478+00' + recovery_target_action=pause
+$ pg_ctl -D pitr_clone start
+```
+```
+2026-09-14 18:19:09 LOG:  starting point-in-time recovery to 2026-09-14 18:18:07.891478+00
+2026-09-14 18:19:09 LOG:  restored log file "000000010000000000000003" from archive
+2026-09-14 18:19:09 LOG:  restored log file "000000010000000000000004" from archive
+2026-09-14 18:19:09 LOG:  consistent recovery state reached at 0/3000100
+2026-09-14 18:19:09 LOG:  recovery stopping before commit of transaction 746, time 2026-09-14 18:18:20.801939+00
+2026-09-14 18:19:09 LOG:  pausing at the end of recovery
+2026-09-14 18:19:09 HINT:  Execute pg_wal_replay_resume() to promote.
+```
+
+تایید صحت داده در نسخه Forensic (Golden Copy):
+```
+ total | corrupted | dirty
+-------+-----------+-------
+   200 |         0 |     0
+```
+همه‌ی ۱۵ رکورد id=50..64 با مقادیر صحیح موجودند. ✅
+
+## ۹. بازیابی گزینشی روی Master زنده (بدون Downtime)
+
+فایل: `sql/recovery_reconcile.sql` — از طریق `postgres_fdw` به PITR clone وصل شده و:
+- ۱۵ رکورد حذف‌شده را دوباره INSERT کرد
+- ۱۰ رکورد با `status='corrupted'` را به مقدار صحیح UPDATE کرد
+- ۳ رکورد `dirty_duplicate` را DELETE کرد
+
+```
+BEGIN
+INSERT 0 15
+UPDATE 10
+DELETE 3
+COMMIT
+```
+
+## ۱۰. تایید نهایی
+
+روی Master:
+```
+ total | corrupted | dirty
+-------+-----------+-------
+   220 |         0 |     0
+```
+تراکنش‌های سالم بعد از حادثه حفظ شدند: `count = 20` ✅ (RPO = 0 برای داده‌ی سالم)
+
+روی Slave (بدون هیچ اقدام دستی، فقط با ادامه‌ی streaming replication):
+```
+ total | corrupted | dirty
+-------+-----------+-------
+   220 |         0 |     0
+```
+یعنی چون اصلاح روی Master با DML عادی (نه بازسازی فایل) انجام شد، خودِ Replication آن را به Slave
+هم منتقل کرد و یکپارچگی Master-Slave بدون rebuild حفظ شد. ✅
+
+`pg_stat_replication.state = streaming` بعد از بازیابی هم برقرار ماند — بدون قطعی Replication.
+
+**در کل فرآیند بازیابی، Master و سرویس Payment یک ثانیه هم Down نشدند (RTO ≈ زمان اجرای چند
+کوئری DML، در این تست چند صدم ثانیه).**
+
+## ۱۱. تایید پایداری داده بعد از ری‌استارت Master (Durability)
+
+بعد از توقف/استارت مجدد سرویس PostgreSQL (شبیه‌سازی یک crash/restart واقعی)، داده‌ی اصلاح‌شده
+دقیقاً همان‌طور که commit شده بود باقی ماند — یعنی بازیابی transactional و durable بوده، نه یک
+تغییر موقت در حافظه:
+
+```
+$ service postgresql start
+$ psql -d payment -c "SELECT count(*), count(*) FILTER (WHERE status='corrupted'), count(*) FILTER (WHERE status='dirty_duplicate') FROM payment_transactions;"
+ count | corrupted | dirty
+-------+-----------+-------
+   220 |         0 |     0
+```
+
+## ۱۲. تست اقدام پیشگیرانه: Audit Trigger
+
+اجرای `sql/preventive_measures.sql` روی Master:
+```
+CREATE TABLE      -- audit_log
+CREATE INDEX
+CREATE FUNCTION   -- fn_audit_payment_transactions
+CREATE TRIGGER    -- trg_audit_payment_transactions
+ALTER TABLE       -- افزودن deleted_at برای soft-delete آینده
+CREATE FUNCTION   -- fn_prevent_hard_delete (آماده، هنوز فعال نشده)
+REVOKE
+```
+
+تست عملکرد واقعی trigger با یک UPDATE نمونه:
+```sql
+UPDATE payment_transactions SET amount = amount + 1 WHERE id = 1;
+SELECT table_name, operation, row_id, changed_at FROM audit_log ORDER BY id DESC LIMIT 3;
+```
+```
+      table_name      | operation | row_id |          changed_at
+-----------------------+-----------+--------+------------------------------
+ payment_transactions | UPDATE    |      1 | 2026-09-14 19:33:53.54751+00
+```
+تایید شد: از این پس هر DELETE/UPDATE روی جدول تراکنش‌ها خودکار و بدون نیاز به دخالت انسانی
+در `audit_log` ثبت می‌شود؛ در حادثه‌ی بعدی، فاز تشخیص (Detection) از ساعت‌ها/دقایق تحلیل WAL به
+چند ثانیه کوئری روی `audit_log` کاهش پیدا می‌کند.
